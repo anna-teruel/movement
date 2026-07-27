@@ -429,7 +429,9 @@ class DataLoader(QWidget):
         in the Tracks layer, so the track segment connecting the
         previous frame to this one terminates at the dragged position.
         """
-        tracks_layer = points_layer.metadata[TRACKS_LAYER_KEY]
+        tracks_layer = points_layer.metadata.get(TRACKS_LAYER_KEY)
+        if tracks_layer is None:
+            return
 
         # Points and Tracks layers are built from the same NaN-filtered
         # array in the same row order (see _add_points_layer/
