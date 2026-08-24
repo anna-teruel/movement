@@ -1,8 +1,9 @@
 """Widget flagging which frames contain edited points.
 
-Adapted from a pattern for docking a ``matplotlib`` canvas in napari and
-syncing it to the current frame via ``viewer.dims.events.current_step``:
-https://gist.github.com/jni/a0ae9793a0ca43868dd7dce7ea21df79
+Renders the timeline as a Plotly figure inside a ``QWebEngineView``, synced
+to the current frame via ``viewer.dims.events.current_step``. Pan and zoom
+are Plotly's native drag/scroll behaviour; clicks on a bar are relayed back
+from JavaScript to Python over a ``QWebChannel``.
 
 Instantiated by :class:`~movement.napari.meta_widget.MovementMetaWidget`,
 which docks it at the bottom of the viewer (rather than nesting it as a
@@ -10,16 +11,21 @@ collapsible section) since it's a wide timeline, not a compact control
 panel.
 """
 
+import json
+import os
+import tempfile
+
 import numpy as np
-from matplotlib.backends.backend_qtagg import (
-    FigureCanvasQTAgg as FigureCanvas,
-)
-from matplotlib.figure import Figure
+import plotly.graph_objects as go
+import plotly.io as pio
 from napari.layers import Points
 from napari.layers.base import ActionType
 from napari.utils.theme import get_theme
 from napari.viewer import Viewer
-from qtpy.QtCore import QTimer
+from qtpy.QtCore import QObject, QTimer, QUrl, Slot
+from qtpy.QtGui import QColor
+from qtpy.QtWebChannel import QWebChannel
+from qtpy.QtWebEngineWidgets import QWebEngineView
 from qtpy.QtWidgets import QCheckBox, QVBoxLayout, QWidget
 
 from movement.napari.loader_widgets import (
@@ -30,27 +36,31 @@ from movement.napari.loader_widgets import (
 PLAYHEAD_COLOR = "#55606E"  # bar indicating current frame
 # this is same color as napari slidebar.
 
-# A click never lands exactly on a frame (e.g. 42.3, not 42), so treat
-# any click within this fraction of the visible frame range as a hit.
-CLICK_TOLERANCE_FRACTION = 0.02
+PLOT_DIV_ID = "movement-edit-timeline"
+BAR_WIDTH_FRAMES = 1  # bar width, in frame units
 
-MIN_VISIBLE_FRAMES = 5
-ZOOM_IN_FACTOR = 0.8
-ZOOM_OUT_FACTOR = 1.25
 
-# Mouse movements below this many pixels are treated as a click, not
-# the start of a pan drag (avoids a shaky click being read as a pan).
-DRAG_THRESHOLD_PIXELS = 3
+class _Bridge(QObject):
+    """Relays timeline-bar clicks from JavaScript back to Python."""
+
+    def __init__(self, on_bar_click):
+        super().__init__()
+        self._on_bar_click = on_bar_click
+
+    @Slot(float)
+    def on_bar_click(self, frame: float) -> None:
+        """Handle a click on a bar, forwarded from the JS side."""
+        self._on_bar_click(frame)
 
 
 class EditWidget(QWidget):
     """Dock widget flagging frames with edited points.
 
-    Draws one lane per individual, with a vertical bar for every frame
-    that contains an edited point on the currently active ``movement``
-    Points layer. Bars are coloured to match that point's colour in the
-    Points/Tracks layers. A playhead line marks the frame currently
-    shown in the viewer. Scroll to zoom in/out on the timeline, and
+    Draws one lane per individual, with a bar for every frame that
+    contains an edited point on the currently active ``movement`` Points
+    layer. Bars are coloured to match that point's colour in the
+    Points/Tracks layers. A playhead line marks the frame currently shown
+    in the viewer. Scroll to zoom in/out on the timeline, drag to pan, and
     click a bar to jump to that frame.
     """
 
@@ -60,23 +70,20 @@ class EditWidget(QWidget):
         self.viewer = napari_viewer
         self.active_layer: Points | None = None
         self._show_individuals = False
-        self._bars: list = []
-        self._edited_frames = np.array([])
         self._removed_points: list = []
         self._max_frame = 0
-        self._press_pixel_x: float | None = None
-        self._press_xlim: tuple[float, float] | None = None
-        self._press_event = None
-        self._pan_scale = 0.0
-        self._dragged = False
+        self._page_ready = False
+        self._pending_js: list[str] = []
+        self._html_path: str | None = None
 
-        self.figure = Figure(figsize=(6, 2.5))
-        self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(200)
-        self.ax = self.figure.subplots()
-        self._style_axes()
-        self.playhead = self.ax.axvline(0, color=PLAYHEAD_COLOR, linewidth=1)
-        self._apply_theme()
+        self._bridge = _Bridge(self._jump_to_frame)
+        self.channel = QWebChannel()
+        self.channel.registerObject("bridge", self._bridge)
+
+        self.view = QWebEngineView()
+        self.view.setMinimumHeight(200)
+        self.view.page().setWebChannel(self.channel)
+        self.view.loadFinished.connect(self._on_page_loaded)
 
         self.show_individuals_checkbox = QCheckBox("Display individuals")
         self.show_individuals_checkbox.setChecked(self._show_individuals)
@@ -87,7 +94,7 @@ class EditWidget(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.show_individuals_checkbox)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.view)
         self.setLayout(layout)
 
         self.viewer.dims.events.current_step.connect(self._on_step_changed)
@@ -97,22 +104,204 @@ class EditWidget(QWidget):
         self.viewer.layers.events.inserted.connect(self._on_layer_inserted)
         self.viewer.layers.events.removed.connect(self._on_layer_removed)
         self.viewer.events.theme.connect(self._apply_theme)
-        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
-        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_motion)
-        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+
+        self._load_initial_page()
 
         for layer in self.viewer.layers:
             self._track_layer(layer)
         self._on_active_layer_changed()
 
-    def _style_axes(self):
-        """Set the static appearance of the timeline axes."""
-        self.ax.set_yticks([])
-        self.ax.set_ylim(0, 1)
-        self.ax.set_xlabel("frame")
-        self.ax.set_title("Edited frames", fontsize="small")
-        self.figure.tight_layout()
+    def _load_initial_page(self) -> None:
+        """Build the initial figure and load it into the web view."""
+        theme = get_theme(self.viewer.theme)
+        background_hex = theme.background.as_hex()
+        fig = self._build_initial_figure(theme)
+        html = pio.to_html(
+            fig,
+            include_plotlyjs=True,
+            full_html=True,
+            div_id=PLOT_DIV_ID,
+            config={"scrollZoom": True},
+            post_script=self._bootstrap_js(),
+        )
+        # Load qwebchannel.js (built into QtWebEngine) before the Plotly
+        # script runs, so the bootstrap script below can use it. Also zero
+        # out the page's default margin/background: left as-is, the 8px
+        # default body margin shows the web view's native white background
+        # as a border around the (themed, dark) plot.
+        html = html.replace(
+            "<head>",
+            '<head><script src="qrc:///qtwebchannel/qwebchannel.js">'
+            "</script>"
+            "<style>html, body {margin: 0; padding: 0; height: 100%; "
+            f"width: 100%; background: {background_hex};"
+            "}</style>",
+            1,
+        )
+        # Also set the native page background, so there's no white flash
+        # before the stylesheet above has been parsed.
+        self.view.page().setBackgroundColor(QColor(background_hex))
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".html", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(html)
+            self._html_path = f.name
+        self.view.load(QUrl.fromLocalFile(self._html_path))
+
+    def _build_initial_figure(self, theme) -> go.Figure:
+        """Build the empty timeline figure, styled for the current theme."""
+        fig = go.Figure(
+            go.Bar(
+                x=[],
+                y=[],
+                base=[],
+                text=[],
+                width=BAR_WIDTH_FRAMES,
+                marker={"color": []},
+                hovertemplate="frame %{x}<br>%{text}<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            title={"text": "Edited frames", "font": {"size": 12}},
+            xaxis={"title": "frame", "range": [0, max(self._max_frame, 1)]},
+            # `visible: False` would suppress tick labels entirely, even
+            # once _redraw_bars sets tickvals/ticktext for the
+            # "Display individuals" lanes -- so keep the axis itself
+            # visible and toggle just `showticklabels` per redraw instead.
+            yaxis={
+                "range": [0, 1],
+                "fixedrange": True,
+                "showgrid": False,
+                "zeroline": False,
+                "showline": False,
+                "ticks": "",
+                "showticklabels": False,
+                "automargin": True,
+            },
+            dragmode="pan",
+            showlegend=False,
+            margin={"l": 10, "r": 10, "t": 30, "b": 30},
+            paper_bgcolor=theme.background.as_hex(),
+            plot_bgcolor=theme.background.as_hex(),
+            font={"color": theme.text.as_hex()},
+            shapes=[
+                {
+                    "type": "line",
+                    "x0": 0,
+                    "x1": 0,
+                    "y0": 0,
+                    "y1": 1,
+                    "xref": "x",
+                    "yref": "paper",
+                    "line": {"color": PLAYHEAD_COLOR, "width": 1},
+                }
+            ],
+        )
+        return fig
+
+    @staticmethod
+    def _bootstrap_js() -> str:
+        """JS wiring run once the initial figure has been drawn.
+
+        Opens the QWebChannel to reach the Python-side ``bridge``, and
+        wires up clicking the timeline (jump to frame) and double-clicking
+        it (reset the visible range to the full timeline).
+
+        Click detection is done at the DOM level (mousedown/mouseup pixel
+        deltas), not via Plotly's own ``plotly_click``: that event only
+        fires on a precise hit against a bar mark, which -- combined with
+        ``dragmode: 'pan'`` treating any small pointer movement as the
+        start of a pan -- made real clicks unreliable in practice (the
+        view would pan by a few pixels instead of registering a click).
+        Converting the release pixel straight to a frame via the axis's
+        ``p2d`` (pixel-to-data) also means clicking *near* a thin bar
+        still jumps to that frame, without needing an exact hit.
+        """
+        return f"""
+        var gd = document.getElementById('{PLOT_DIV_ID}');
+        // Overwritten with the real value once the active layer is known
+        // (see EditWidget._reset_xlim); 0 is just a safe initial default.
+        window._movementMaxFrame = 0;
+        new QWebChannel(qt.webChannelTransport, function(channel) {{
+            window.movementBridge = channel.objects.bridge;
+        }});
+
+        var DRAG_THRESHOLD_PX = 3;
+        var DOUBLE_CLICK_DELAY_MS = 250;
+        var downX = null, downY = null, dragged = false, clickTimer = null;
+
+        function jumpToPixel(clientX, clientY) {{
+            var size = gd._fullLayout._size;
+            var rect = gd.getBoundingClientRect();
+            var px = clientX - rect.left;
+            var py = clientY - rect.top;
+            if (px < size.l || px > size.l + size.w ||
+                py < size.t || py > size.t + size.h) {{
+                return;  // click landed outside the plotting area
+            }}
+            if (window.movementBridge) {{
+                // p2d expects a pixel relative to the plot area's own
+                // origin, not the container -- subtract the left margin.
+                var frame = gd._fullLayout.xaxis.p2d(px - size.l);
+                window.movementBridge.on_bar_click(Math.round(frame));
+            }}
+        }}
+
+        gd.addEventListener('mousedown', function(e) {{
+            downX = e.clientX;
+            downY = e.clientY;
+            dragged = false;
+        }});
+        gd.addEventListener('mousemove', function(e) {{
+            if (downX === null) return;
+            if (Math.abs(e.clientX - downX) > DRAG_THRESHOLD_PX ||
+                Math.abs(e.clientY - downY) > DRAG_THRESHOLD_PX) {{
+                dragged = true;
+            }}
+        }});
+        gd.addEventListener('mouseup', function(e) {{
+            var wasDrag = dragged;
+            downX = null;
+            downY = null;
+            dragged = false;
+            if (wasDrag) return;
+            if (clickTimer) {{
+                // A second click within the window: it's a double-click,
+                // handled separately below -- cancel the pending single.
+                clearTimeout(clickTimer);
+                clickTimer = null;
+                return;
+            }}
+            var clientX = e.clientX, clientY = e.clientY;
+            clickTimer = setTimeout(function() {{
+                clickTimer = null;
+                jumpToPixel(clientX, clientY);
+            }}, DOUBLE_CLICK_DELAY_MS);
+        }});
+        gd.addEventListener('dblclick', function() {{
+            if (clickTimer) {{
+                clearTimeout(clickTimer);
+                clickTimer = null;
+            }}
+            Plotly.relayout(
+                gd, {{'xaxis.range': [0, window._movementMaxFrame]}}
+            );
+        }});
+        """
+
+    def _run_js(self, script: str) -> None:
+        """Run JS in the web view, queuing it if the page isn't loaded yet."""
+        if self._page_ready:
+            self.view.page().runJavaScript(script)
+        else:
+            self._pending_js.append(script)
+
+    def _on_page_loaded(self, ok: bool) -> None:
+        """Flush any JS queued before the page finished loading."""
+        self._page_ready = ok
+        pending, self._pending_js = self._pending_js, []
+        for script in pending:
+            self._run_js(script)
 
     def _apply_theme(self, event=None):
         """Style the plot to match the current napari theme.
@@ -121,18 +310,17 @@ class EditWidget(QWidget):
         if the user switches between napari's dark and light themes.
         """
         theme = get_theme(self.viewer.theme)
-        background = theme.background.as_hex()
-        foreground = theme.text.as_hex()
-
-        self.figure.set_facecolor(background)
-        self.ax.set_facecolor(background)
-        self.ax.xaxis.label.set_color(foreground)
-        self.ax.title.set_color(foreground)
-        self.ax.tick_params(axis="both", colors=foreground)
-        for spine in self.ax.spines.values():
-            spine.set_color(foreground)
-
-        self.canvas.draw_idle()
+        background_hex = theme.background.as_hex()
+        self.view.page().setBackgroundColor(QColor(background_hex))
+        update = {
+            "paper_bgcolor": background_hex,
+            "plot_bgcolor": background_hex,
+            "font.color": theme.text.as_hex(),
+        }
+        self._run_js(
+            f"document.body.style.background = '{background_hex}';"
+            f"Plotly.relayout('{PLOT_DIV_ID}', {json.dumps(update)});"
+        )
 
     def _track_layer(self, layer):
         """Connect to a movement Points layer's data-change event."""
@@ -265,19 +453,28 @@ class EditWidget(QWidget):
         if not step:
             return
         frame = step[0]
-        self.playhead.set_xdata([frame, frame])
-        self.canvas.draw_idle()
+        update = {"shapes[0].x0": int(frame), "shapes[0].x1": int(frame)}
+        self._run_js(
+            f"Plotly.relayout('{PLOT_DIV_ID}', {json.dumps(update)});"
+        )
+
+    @staticmethod
+    def _to_rgba_str(color) -> str:
+        """Convert an RGBA float array (0-1) to a CSS ``rgba()`` string."""
+        r, g, b, a = color
+        return f"rgba({int(r * 255)},{int(g * 255)},{int(b * 255)},{a})"
 
     def _redraw_bars(self):
         """Redraw the per-individual lanes of edited-frame bars."""
-        for artist in self._bars:
-            artist.remove()
-        self._bars = []
-        self._edited_frames = np.array([])
-
         if self.active_layer is None:
-            self.ax.set_yticks([])
-            self._on_step_changed()
+            self._run_js(
+                f"Plotly.restyle('{PLOT_DIV_ID}', "
+                "{x: [[]], y: [[]], base: [[]], text: [[]], "
+                "'marker.color': [[]]}, [0]);"
+                f"Plotly.relayout('{PLOT_DIV_ID}', "
+                "{'yaxis.tickvals': [], 'yaxis.ticktext': [], "
+                "'yaxis.showticklabels': false});"
+            )
             return
 
         individuals = self.active_layer.properties["individual"]
@@ -291,14 +488,14 @@ class EditWidget(QWidget):
         if self._show_individuals:
             n_lanes = len(unique_individuals)
             lane_of = {ind: i for i, ind in enumerate(unique_individuals)}
-            self.ax.set_yticks([(i + 0.5) / n_lanes for i in range(n_lanes)])
-            self.ax.set_yticklabels(unique_individuals, fontsize="small")
+            tickvals = [(i + 0.5) / n_lanes for i in range(n_lanes)]
+            ticktext = unique_individuals
         else:
             # A single shared lane: one bar per edited frame, regardless
             # of how many (or which) individuals were edited on it.
             n_lanes = 1
             lane_of = dict.fromkeys(unique_individuals, 0)
-            self.ax.set_yticks([])
+            tickvals, ticktext = [], []
         lane_height = 1.0 / n_lanes
 
         # Combine moved (still-live) and removed points into one list of
@@ -314,6 +511,7 @@ class EditWidget(QWidget):
             ]
         all_points = moved_points + self._removed_points
 
+        bar_x, bar_base, bar_colors, bar_text = [], [], [], []
         if all_points:
             # A frame may have several edited keypoints for the same
             # individual; only draw one bar per (frame, individual) --
@@ -326,104 +524,53 @@ class EditWidget(QWidget):
                     continue
                 seen.add(key)
                 lane = lane_of[individual]
-                y0, y1 = lane * lane_height, (lane + 1) * lane_height
-                self._bars.append(
-                    self.ax.vlines(frame, y0, y1, colors=[color], linewidth=2)
-                )
-            self._edited_frames = np.unique([p[0] for p in all_points])
+                bar_x.append(float(frame))
+                bar_base.append(lane * lane_height)
+                bar_colors.append(self._to_rgba_str(color))
+                bar_text.append(str(individual))
 
-        self._on_step_changed()
+        bar_y = [lane_height] * len(bar_x)
+        self._run_js(
+            f"Plotly.restyle('{PLOT_DIV_ID}', "
+            + json.dumps(
+                {
+                    "x": [bar_x],
+                    "y": [bar_y],
+                    "base": [bar_base],
+                    "text": [bar_text],
+                    "marker.color": [bar_colors],
+                }
+            )
+            + ", [0]);"
+            f"Plotly.relayout('{PLOT_DIV_ID}', "
+            + json.dumps(
+                {
+                    "yaxis.tickvals": tickvals,
+                    "yaxis.ticktext": ticktext,
+                    "yaxis.showticklabels": self._show_individuals,
+                }
+            )
+            + ");"
+        )
 
     def _reset_xlim(self):
         """Reset the visible frame range to the full extent."""
-        self.ax.set_xlim(0, max(self._max_frame, 1))
-        self.canvas.draw_idle()
-
-    def _on_scroll(self, event):
-        """Zoom the timeline in/out around the cursor position."""
-        if event.inaxes != self.ax or event.xdata is None:
-            return
-        xmin, xmax = self.ax.get_xlim()
-        span = xmax - xmin
-        factor = ZOOM_IN_FACTOR if event.button == "up" else ZOOM_OUT_FACTOR
         full_span = max(self._max_frame, 1)
-        new_span = min(max(span * factor, MIN_VISIBLE_FRAMES), full_span)
+        self._run_js(
+            f"window._movementMaxFrame = {full_span};"
+            f"Plotly.relayout('{PLOT_DIV_ID}', "
+            f"{{'xaxis.range': [0, {full_span}]}});"
+        )
 
-        frac = (event.xdata - xmin) / span if span else 0.5
-        new_xmin = event.xdata - frac * new_span
-        new_xmin = max(0, min(new_xmin, full_span - new_span))
-        self.ax.set_xlim(new_xmin, new_xmin + new_span)
-        self.canvas.draw_idle()
-
-    def _on_mouse_press(self, event):
-        """Record the drag start point, in case this becomes a pan."""
-        if event.inaxes != self.ax or event.xdata is None:
-            return
-        self._press_event = event
-        self._press_pixel_x = event.x
-        self._press_xlim = self.ax.get_xlim()
-        # Data units per screen pixel, fixed for the duration of this
-        # drag so panning doesn't compound as the view shifts (see
-        # _on_mouse_motion).
-        axes_width_pixels = self.ax.get_window_extent().width
-        span = self._press_xlim[1] - self._press_xlim[0]
-        self._pan_scale = span / axes_width_pixels if axes_width_pixels else 0
-        self._dragged = False
-
-    def _on_mouse_motion(self, event):
-        """Pan the timeline while the mouse is dragged.
-
-        Uses the fixed pixel-to-data scale captured on press, rather
-        than the live axes transform, so that repeated small moves
-        accumulate into the total drag distance instead of being
-        computed (and partly cancelled out) against an already-shifted
-        view on every step.
-        """
-        if self._press_pixel_x is None or event.x is None:
-            return
-        pixel_dx = event.x - self._press_pixel_x
-        if abs(pixel_dx) > DRAG_THRESHOLD_PIXELS:
-            self._dragged = True
-        if not self._dragged:
-            return
-
-        data_dx = pixel_dx * self._pan_scale
-        xmin0, xmax0 = self._press_xlim
-        span = xmax0 - xmin0
-        full_span = max(self._max_frame, 1)
-        new_xmin = max(0, min(xmin0 - data_dx, full_span - span))
-        self.ax.set_xlim(new_xmin, new_xmin + span)
-        self.canvas.draw_idle()
-
-    def _on_mouse_release(self, event):
-        """Treat the gesture as a click if the mouse never really moved."""
-        if self._press_pixel_x is None:
-            return
-        if not self._dragged:
-            self._handle_click(self._press_event)
-        self._press_pixel_x = None
-        self._press_xlim = None
-        self._press_event = None
-
-    def _handle_click(self, event):
-        """Jump the viewer to the edited frame nearest the click.
-
-        Double-clicking resets the timeline to the full frame range.
-        Clicks too far from any edited-frame bar are ignored.
-        """
-        if event.dblclick:
-            self._reset_xlim()
-            return
-        if self._edited_frames.size == 0:
-            return
-
-        nearest = self._edited_frames[
-            np.argmin(np.abs(self._edited_frames - event.xdata))
-        ]
-        xmin, xmax = self.ax.get_xlim()
-        tolerance = max(1.0, CLICK_TOLERANCE_FRACTION * (xmax - xmin))
-        if abs(nearest - event.xdata) > tolerance:
-            return
-
+    def _jump_to_frame(self, frame: float) -> None:
+        """Move the napari viewer to the given frame, from a bar click."""
         current_step = self.viewer.dims.current_step
-        self.viewer.dims.current_step = (int(nearest),) + current_step[1:]
+        if not current_step:
+            return
+        self.viewer.dims.current_step = (int(frame),) + current_step[1:]
+
+    def closeEvent(self, event):
+        """Clean up the temporary HTML file backing the web view."""
+        if self._html_path and os.path.exists(self._html_path):
+            os.unlink(self._html_path)
+        super().closeEvent(event)

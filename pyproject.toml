@@ -59,7 +59,7 @@ entry-points."napari.manifest".movement = "movement.napari:napari.yaml"
 "User Support" = "https://neuroinformatics.zulipchat.com/#narrow/stream/406001-Movement"
 
 [project.optional-dependencies]
-napari = ["napari[all]>=0.6.0"]
+napari = ["napari[all]>=0.6.0", "plotly", "PyQt6-WebEngine"]
 
 [dependency-groups]
 dev = [
@@ -150,6 +150,7 @@ module = [
   "pytest.*",
   "loguru.*",
   "qt_niu.*",
+  "plotly.*",
 ]
 ignore_missing_imports = true
 
